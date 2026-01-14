@@ -15,3 +15,10 @@ A Google Gemini-based Discord chatter bot
 3) Add your Discord API and Google API tokens in the py script
 
 4) Run as admin via the .bat/batch file
+
+# Perks & Features
+  * !joinvc - Allows bot to join voice channel user is residing in
+  * !leavevc - Leave voice channel
+  * !joke - Random pre-defined jokes
+  * !quote - Random pre-defined quotes
+  * !goodreads - Pull random quote from Goodreads.com
