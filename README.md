@@ -1,5 +1,5 @@
 # Discord-Gemini-Bot
-A Google Gemini-based Discord chatter bot
+A Google Gemini-based Discord chatter bot, written in Python
 
 # Install
 
