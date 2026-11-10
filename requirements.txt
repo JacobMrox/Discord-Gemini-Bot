@@ -1,0 +1,12 @@
+# Core Discord client (voice extras pull in the audio dependencies)
+discord.py[voice]>=2.4
+aiohttp>=3.9
+
+# Natural neural voices (recommended, free)
+edge-tts>=7.0
+
+# Classic fallback voice
+gTTS>=2.5
+
+# !goodreads quote scraping
+beautifulsoup4>=4.12

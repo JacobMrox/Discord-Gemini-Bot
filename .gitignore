@@ -1,0 +1,16 @@
+# Secrets and local state
+.env
+settings.json
+.tts_cache/
+ffmpeg.exe
+ffmpeg
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+Thumbs.db
+.DS_Store
