@@ -35,6 +35,8 @@ channel with a natural neural voice.
    * Discord: <https://discord.com/developers/applications> → your app → **Bot** →
      enable **Message Content Intent** → copy the token.
    * Gemini: <https://aistudio.google.com/apikey> → create an API key.
+   * Optional, for the other free models: OpenRouter
+     (<https://openrouter.ai/keys>) or Groq (<https://console.groq.com/keys>).
 
 4. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN` and `GEMINI_API_KEY`.
    (If you skip this step, the bot creates `.env`, opens it in a text editor and
@@ -65,6 +67,7 @@ unless you set `ALLOW_EVERYONE_TO_CONFIGURE=true`.
 | `!model` | Show the model menu |
 | `!model 2` / `!model gemini-3.5-flash-lite` | Switch model |
 | `!models` | List every text model your API key can use, live from the API |
+| `!provider` | Show the free providers; `!provider groq` switches (and resets the model) |
 
 ### Voice
 | Command | What it does |
@@ -90,6 +93,25 @@ unless you set `ALLOW_EVERYONE_TO_CONFIGURE=true`.
 ### Fun
 `!joke`, `!quote`, `!goodreads`
 
+## Other free providers
+
+You are not limited to Google. `!provider` switches between Gemini, **OpenRouter**
+and **Groq**, each with its own free tier, and `!model` / `!models` follow whichever
+provider the server is on.
+
+| Provider | Key | Free models |
+| --- | --- | --- |
+| `gemini` | `GEMINI_API_KEY` | Gemini 3.8 Flash and friends |
+| `openrouter` | `OPENROUTER_API_KEY` | `openrouter/free` (auto-picks a working free model) plus many `:free` models: Gemma 4, Llama 3.3/4, Qwen, DeepSeek, Nemotron |
+| `groq` | `GROQ_API_KEY` | `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`, served very fast |
+
+`PROVIDER=auto` (the default) uses the first provider that has a key, in that order.
+Each server can switch with `!provider`, which also selects that provider's default
+model. Free limits are real, so a busy server may want to rotate providers:
+OpenRouter allows 20 requests/minute and 50/day without credit, Groq 30/minute and
+1000/day per model. `!models` reads the live roster, so new free models appear
+without touching this file.
+
 ## Voices
 
 * **edge** (default, free, no API cost): Microsoft neural voices. `en-US-AvaNeural`
@@ -108,6 +130,11 @@ Everything in `.env.example` is optional except the two credentials. Useful ones
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GEMINI_MODEL` | `gemini-3.8-flash` | Default model |
+| `PROVIDER` | `auto` | `auto`, `gemini`, `openrouter` or `groq` |
+| `OPENROUTER_API_KEY` | – | Enables the OpenRouter free models |
+| `GROQ_API_KEY` | – | Enables Groq's free tier |
+| `OPENROUTER_MODEL` | `openrouter/free` | Default OpenRouter model |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Default Groq model |
 | `TTS_ENGINE` | `auto` | `auto`, `edge`, `gemini`, `gtts` or `off` |
 | `TTS_VOICE` | `en-US-AvaNeural` | Edge voice |
 | `TEMPERATURE` | `0.8` | Creativity |
@@ -128,6 +155,10 @@ Per-server changes live in `settings.json` (git-ignored). Delete it or run
 * **Robotic voice, or `!tts` says `gtts`** – edge-tts is not installed. Run `Run.bat`
   again so it installs the full dependency list; the startup lines report exactly
   which TTS libraries loaded.
+* **Voice joins then drops, log says `4017`** – Discord requires the DAVE/E2EE
+  protocol for voice since March 2026, which needs discord.py 2.7 or newer. `Run.bat`
+  installs it automatically; to force it, run
+  `python -m pip install --upgrade "discord.py[voice]"`.
 * **404 on a model** – model IDs change. Run `!models` and pick a current one.
 * **No reply at all** – the bot needs the *Message Content Intent* enabled in the
   developer portal, otherwise it never sees your messages.

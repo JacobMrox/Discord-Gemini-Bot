@@ -1,5 +1,7 @@
-# Core Discord client (voice extras pull in the audio dependencies)
-discord.py[voice]>=2.4
+# Discord client. 2.7+ is mandatory: Discord rejects voice connections from
+# clients without the DAVE (E2EE) protocol with close code 4017 since March 2026,
+# and the [voice] extra pulls in davey, which implements it.
+discord.py[voice]>=2.7.1
 aiohttp>=3.9
 
 # Natural neural voices (recommended, free)

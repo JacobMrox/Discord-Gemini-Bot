@@ -144,6 +144,91 @@ MODEL_CATALOG: list[tuple[str, str]] = [
     ("gemini-2.5-flash", "legacy - reroutes to 3.5 Flash-Lite on 2026-12-01"),
 ]
 
+#: Every provider has a free tier. OpenAI-compatible ones share one client.
+PROVIDERS: dict[str, dict[str, str]] = {
+    "gemini": {
+        "label": "Google Gemini",
+        "key_env": "GEMINI_API_KEY",
+        "signup": "https://aistudio.google.com/apikey",
+        "base_url": API_ROOT,
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "key_env": "OPENROUTER_API_KEY",
+        "signup": "https://openrouter.ai/keys",
+        "base_url": "https://openrouter.ai/api/v1",
+    },
+    "groq": {
+        "label": "Groq",
+        "key_env": "GROQ_API_KEY",
+        "signup": "https://console.groq.com/keys",
+        "base_url": "https://api.groq.com/openai/v1",
+    },
+}
+
+#: Curated menus for ``!model``. Free rosters rotate, so ``!models`` asks the live API.
+PROVIDER_MODELS: dict[str, list[tuple[str, str]]] = {
+    "gemini": MODEL_CATALOG,
+    "openrouter": [
+        ("openrouter/free", "auto-picks a working free model (default)"),
+        ("google/gemma-4-31b-it:free", "Google Gemma 4 31B, 262K context"),
+        ("google/gemma-4-26b-a4b-it:free", "smaller Gemma 4, quick"),
+        ("meta-llama/llama-3.3-70b-instruct:free", "Meta Llama 3.3 70B"),
+        ("meta-llama/llama-4-maverick:free", "Meta Llama 4 Maverick"),
+        ("qwen/qwen3-next-80b-a3b-instruct:free", "Qwen3 Next 80B"),
+        ("deepseek/deepseek-chat-v3-0324:free", "DeepSeek V3 chat"),
+        ("openai/gpt-oss-20b:free", "OpenAI GPT-OSS 20B"),
+        ("nvidia/nemotron-3-super-120b-a12b:free", "NVIDIA Nemotron 3 Super 120B"),
+    ],
+    "groq": [
+        ("openai/gpt-oss-120b", "flagship open-weight model, very fast (default)"),
+        ("openai/gpt-oss-20b", "smaller and faster"),
+        ("qwen/qwen3.8-27b", "Alibaba Qwen 3.8 27B"),
+    ],
+}
+
+DEFAULT_MODELS: dict[str, str] = {
+    "gemini": DEFAULT_MODEL,
+    "openrouter": "openrouter/free",
+    "groq": "openai/gpt-oss-120b",
+}
+
+
+def configured_providers() -> list[str]:
+    """Providers that have a key, in this file's preference order."""
+    found: list[str] = []
+    for name, info in PROVIDERS.items():
+        key = env_str(info["key_env"])
+        if not key and name == "gemini":
+            key = env_str("GOOGLE_API_KEY")
+        if key:
+            found.append(name)
+    return found
+
+
+def resolve_provider(name: str, available: Optional[list[str]] = None) -> str:
+    """``auto`` picks the first configured provider; an explicit choice is kept."""
+    available = configured_providers() if available is None else available
+    name = (name or "auto").lower().strip()
+    if name in PROVIDERS:
+        return name
+    return available[0] if available else "gemini"
+
+
+def default_model_for(provider: str) -> str:
+    return DEFAULT_MODELS.get(provider, DEFAULT_MODEL)
+
+
+def model_looks_like(model: str, provider: str) -> bool:
+    """Whether a stored model id plausibly belongs to ``provider``."""
+    model = (model or "").strip()
+    if not model:
+        return False
+    if provider == "gemini":
+        return model.startswith("gemini-")
+    return "/" in model or model == "openrouter/free"
+
+
 #: (voice id, alias, locale, gender, note)
 EDGE_VOICES: list[tuple[str, str, str, str, str]] = [
     ("en-US-AvaNeural", "ava", "en-US", "female", "warm and natural (default)"),
@@ -336,6 +421,7 @@ def _api_error_message(status: int, body: str) -> str:
     hints = {
         400: "the request was rejected (check the model name)",
         401: "the API key was rejected",
+        402: "this key has no credit left",
         403: "this API key is not allowed to use that model",
         404: "that model does not exist any more - try !models",
         429: "rate limit reached, give it a few seconds",
@@ -455,6 +541,152 @@ class GeminiClient:
             if blob and blob.get("data"):
                 return base64.b64decode(blob["data"])
         raise GeminiError("Gemini TTS returned no audio (try !tts edge instead)")
+
+
+def contents_to_messages(contents: list[dict], system: str = "") -> list[dict]:
+    """Translate the Gemini-style conversation into OpenAI chat messages."""
+    messages: list[dict[str, Any]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    for turn in contents:
+        role = "assistant" if turn.get("role") == "model" else "user"
+        parts = turn.get("parts") or []
+        texts = [str(part.get("text")) for part in parts if part.get("text")]
+        images = [part["inlineData"] for part in parts if part.get("inlineData")]
+        if images:
+            content: list[dict[str, Any]] = [
+                {"type": "text", "text": "\n".join(texts) or "What is in this image?"}
+            ]
+            for blob in images:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:%s;base64,%s"
+                            % (blob.get("mimeType", "image/png"), blob.get("data", ""))
+                        },
+                    }
+                )
+            messages.append({"role": role, "content": content})
+        elif texts:
+            messages.append({"role": role, "content": "\n".join(texts)})
+    return messages
+
+
+class OpenAICompatClient:
+    """Minimal async client for OpenAI-compatible free tiers (OpenRouter, Groq)."""
+
+    def __init__(self, provider: str, api_key: str):
+        self.provider = provider
+        self.label = PROVIDERS[provider]["label"]
+        self.base_url = PROVIDERS[provider]["base_url"].rstrip("/")
+        self.api_key = api_key
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+            if self.provider == "openrouter":
+                headers["X-Title"] = "Discord Gemini Bot"
+            self._session = aiohttp.ClientSession(
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60, connect=15, sock_read=45),
+            )
+        return self._session
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def _post(self, path: str, payload: dict, retries: int = 3) -> dict:
+        session = await self._get_session()
+        delay = 1.0
+        last_error = "request failed"
+        for attempt in range(1, retries + 1):
+            try:
+                async with session.post(f"{self.base_url}/{path}", json=payload) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        try:
+                            return json.loads(body)
+                        except ValueError as exc:
+                            raise GeminiError(f"{self.label} sent unreadable JSON: {exc}") from exc
+                    if resp.status in (429, 500, 502, 503, 504) and attempt < retries:
+                        last_error = _api_error_message(resp.status, body)
+                        print(f"[ai] {self.label} attempt {attempt} failed: {last_error}")
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                        continue
+                    raise GeminiError(_api_error_message(resp.status, body))
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = f"network problem talking to {self.label}: {exc}"
+                print(f"[ai] {self.label} attempt {attempt}/{retries} failed: {exc}")
+                if attempt >= retries:
+                    break
+                await asyncio.sleep(delay)
+                delay *= 2
+        raise GeminiError(last_error)
+
+    async def generate(
+        self,
+        model: str,
+        contents: list[dict],
+        system: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": contents_to_messages(contents, system),
+            "temperature": max(0.0, min(2.0, temperature)),
+            "max_tokens": max(1, min(8_192, max_tokens)),
+        }
+        data = await self._post("chat/completions", payload)
+        choices = data.get("choices") or []
+        if not choices:
+            error = (data.get("error") or {}).get("message")
+            raise GeminiError(error or f"{self.label} returned no answer")
+        message = choices[0].get("message") or {}
+        answer = (message.get("content") or "").strip()
+        if not answer:
+            if message.get("reasoning") or message.get("reasoning_content"):
+                raise GeminiError(
+                    f"{self.label} only returned reasoning for `{model}`, try another model"
+                )
+            raise GeminiError(
+                f"{self.label} returned an empty answer "
+                f"({choices[0].get('finish_reason') or 'unknown'})"
+            )
+        return answer
+
+    async def list_models(self) -> list[str]:
+        session = await self._get_session()
+        try:
+            async with session.get(f"{self.base_url}/models") as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    raise GeminiError(_api_error_message(resp.status, body))
+                data = json.loads(body)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise GeminiError(f"network problem talking to {self.label}: {exc}") from exc
+
+        names: set[str] = set()
+        for entry in data.get("data") or data.get("models") or []:
+            name = str(entry.get("id") or entry.get("name") or "").strip()
+            if not name:
+                continue
+            if self.provider == "openrouter" and not (
+                name.endswith(":free") or name == "openrouter/free"
+            ):
+                continue
+            skip = ("whisper", "tts", "embed", "guard", "rerank", "moderation")
+            if any(token in name.lower() for token in skip):
+                continue
+            names.add(name)
+        return sorted(names)
 
 
 def _extract_text(data: dict) -> str:
@@ -1020,6 +1252,7 @@ async def cmd_settings(bot: "GeminiDiscordBot", message: discord.Message, args: 
     )
     persona = settings["persona"] or bot.store.defaults["persona"]
     embed = discord.Embed(title="Server settings", colour=discord.Colour.dark_teal())
+    embed.add_field(name="Provider", value=f"`{bot.provider_for(settings)}`", inline=True)
     embed.add_field(name="Model", value=f"`{settings['model']}`", inline=True)
     embed.add_field(name="Temperature", value=f"`{settings['temperature']}`", inline=True)
     embed.add_field(name="Max tokens", value=f"`{settings['max_tokens']}`", inline=True)
@@ -1034,16 +1267,20 @@ async def cmd_settings(bot: "GeminiDiscordBot", message: discord.Message, args: 
     await message.reply(embed=embed, mention_author=False)
 
 
-@command("model", "!model [number|name]", "Switch the Gemini model for this server.", group="Models", admin=True)
+@command("model", "!model [number|name]", "Switch the model for this server.", group="Models", admin=True)
 async def cmd_model(bot: "GeminiDiscordBot", message: discord.Message, args: str, settings: dict) -> None:
+    provider = bot.provider_for(settings)
+    catalog = PROVIDER_MODELS.get(provider, MODEL_CATALOG)
     if not args:
         lines = [
             f"`{index}.` `{model_id}` - {note}"
             + ("  **<- current**" if model_id == settings["model"] else "")
-            for index, (model_id, note) in enumerate(MODEL_CATALOG, 1)
+            for index, (model_id, note) in enumerate(catalog, 1)
         ]
         await message.reply(
-            f"Current model: `{settings['model']}`\n" + "\n".join(lines) + f"\nUse `{bot.prefix}model 1` or a full name. `{bot.prefix}models` lists everything the API offers.",
+            f"Current model: `{settings['model']}` via {PROVIDERS[provider]['label']}\n"
+            + "\n".join(lines)
+            + f"\nUse `{bot.prefix}model 1` or a full name. `{bot.prefix}models` lists what the API offers right now.",
             mention_author=False,
         )
         return
@@ -1051,34 +1288,82 @@ async def cmd_model(bot: "GeminiDiscordBot", message: discord.Message, args: str
     choice = args.strip()
     if choice.isdigit():
         index = int(choice)
-        if not 1 <= index <= len(MODEL_CATALOG):
-            await message.reply(f"Pick a number between 1 and {len(MODEL_CATALOG)}.")
+        if not 1 <= index <= len(catalog):
+            await message.reply(f"Pick a number between 1 and {len(catalog)}.")
             return
-        choice = MODEL_CATALOG[index - 1][0]
-    if not re.fullmatch(r"[a-zA-Z0-9._-]+", choice):
+        choice = catalog[index - 1][0]
+    if not re.fullmatch(r"[A-Za-z0-9._:/@-]+", choice):
         await message.reply("That does not look like a model name.")
         return
 
     bot.store.update(guild_key(message), model=choice)
-    await message.reply(f"Model switched to `{choice}`.")
+    await message.reply(f"Model switched to `{choice}` on {PROVIDERS[provider]['label']}.")
 
 
-@command("models", "!models", "List every text model your API key can use right now.", group="Models")
+@command("provider", "!provider [gemini|openrouter|groq]", "Pick which free AI provider to use.", group="Models", admin=True)
+async def cmd_provider(bot: "GeminiDiscordBot", message: discord.Message, args: str, settings: dict) -> None:
+    available = bot.available_providers
+    current = bot.provider_for(settings)
+    if not args:
+        lines = []
+        for name, info in PROVIDERS.items():
+            status = "ready" if name in available else f"needs {info['key_env']}"
+            mark = "  **<- current**" if name == current else ""
+            lines.append(f"`{name}` - {info['label']} ({status}){mark}")
+        await message.reply(
+            "Free AI providers:\n"
+            + "\n".join(lines)
+            + f"\nSwitch with `{bot.prefix}provider groq`. Missing keys go in `.env`.",
+            mention_author=False,
+        )
+        return
+
+    choice = args.strip().lower()
+    if choice not in PROVIDERS:
+        await message.reply(f"Pick one of: {', '.join(PROVIDERS)}")
+        return
+    if choice not in available:
+        info = PROVIDERS[choice]
+        await message.reply(
+            f"{info['label']} needs a key. Add `{info['key_env']}` to `.env` "
+            f"(free key: {info['signup']}) and restart me."
+        )
+        return
+
+    model = default_model_for(choice)
+    bot.store.update(guild_key(message), provider=choice, model=model)
+    bot.clear_guild_memory(guild_key(message))
+    await message.reply(
+        f"Now using {PROVIDERS[choice]['label']} with `{model}`. History cleared, "
+        f"and `{bot.prefix}model` shows the other models."
+    )
+
+
+@command("models", "!models", "List every model your provider offers right now.", group="Models")
 async def cmd_models(bot: "GeminiDiscordBot", message: discord.Message, args: str, settings: dict) -> None:
+    provider = bot.provider_for(settings)
+    info = PROVIDERS[provider]
+    client = bot.providers.get(provider)
+    if client is None:
+        await message.reply(
+            f"{info['label']} is not set up. Add `{info['key_env']}` to `.env` "
+            f"(free key: {info['signup']})."
+        )
+        return
     async with message.channel.typing():
         try:
-            models = await bot.gemini.list_models()
+            models = await client.list_models()
         except GeminiError as exc:
-            await message.reply(f"Could not reach Google: {exc}")
+            await message.reply(f"Could not reach {info['label']}: {exc}")
             return
     if not models:
-        await message.reply("The API did not report any text models. Check the key's project.")
+        await message.reply(f"{info['label']} did not report any text models for this key.")
         return
     shown = models[:60]
     body = "\n".join(("* " if model == settings["model"] else "  ") + model for model in shown)
     more = "" if len(models) <= len(shown) else f"\n...and {len(models) - len(shown)} more"
     await message.reply(
-        f"Models available to this key ({len(models)}):\n```\n{body}{more}\n```\nSwitch with `{bot.prefix}model <name>`.",
+        f"{info['label']} models available ({len(models)}):\n```\n{body}{more}\n```\nSwitch with `{bot.prefix}model <name>`.",
         mention_author=False,
     )
 
@@ -1347,7 +1632,13 @@ async def fetch_goodreads_quote() -> str:
 
 
 class GeminiDiscordBot(discord.Client):
-    def __init__(self, config: dict[str, Any], store: SettingsStore, gemini: GeminiClient):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        store: SettingsStore,
+        gemini: GeminiClient,
+        providers: Optional[dict[str, Any]] = None,
+    ):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
@@ -1355,6 +1646,7 @@ class GeminiDiscordBot(discord.Client):
         self.config = config
         self.store = store
         self.gemini = gemini
+        self.providers = dict(providers or {"gemini": gemini})
         self.prefix = config["prefix"]
         self.players: dict[int, GuildPlayer] = {}
         self.memory: dict[tuple[int, int], list[dict[str, Any]]] = {}
@@ -1362,6 +1654,31 @@ class GeminiDiscordBot(discord.Client):
     # -- helpers ------------------------------------------------------------ #
     def settings_for(self, message: discord.Message) -> dict[str, Any]:
         return self.store.get(guild_key(message))
+
+    @property
+    def available_providers(self) -> list[str]:
+        return [name for name in PROVIDERS if name in self.providers]
+
+    def provider_for(self, settings: dict[str, Any]) -> str:
+        return resolve_provider(settings.get("provider", "auto"), self.available_providers)
+
+    async def ask(self, settings: dict[str, Any], contents: list[dict]) -> str:
+        """Send the conversation to whichever provider this server selected."""
+        provider = self.provider_for(settings)
+        client = self.providers.get(provider)
+        if client is None:
+            info = PROVIDERS[provider]
+            raise GeminiError(
+                f"{info['label']} is not set up - add {info['key_env']} to .env "
+                f"(free key: {info['signup']})"
+            )
+        return await client.generate(
+            settings["model"],
+            contents,
+            self.persona_for(settings),
+            float(settings["temperature"]),
+            int(settings["max_tokens"]),
+        )
 
     def clear_memory(self, message: discord.Message) -> int:
         key = (guild_key(message), message.author.id)
@@ -1383,6 +1700,7 @@ class GeminiDiscordBot(discord.Client):
         engine = resolve_engine(self.store.defaults["tts_engine"])
         print("=" * 62)
         print(f"  Logged in as {self.user} (id {self.user.id})")
+        print(f"  Provider   : {self.provider_for(self.store.defaults)}")
         print(f"  Model      : {self.store.defaults['model']}")
         print(f"  TTS engine : {engine}")
         print(f"  Voice      : {self.store.defaults['gemini_voice'] if engine == 'gemini' else self.store.defaults['edge_voice']}")
@@ -1492,13 +1810,7 @@ class GeminiDiscordBot(discord.Client):
         async with message.channel.typing():
             try:
                 reply = await asyncio.wait_for(
-                    self.gemini.generate(
-                        settings["model"],
-                        contents,
-                        self.persona_for(settings),
-                        float(settings["temperature"]),
-                        int(settings["max_tokens"]),
-                    ),
+                    self.ask(settings, contents),
                     timeout=GENERATE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1507,7 +1819,7 @@ class GeminiDiscordBot(discord.Client):
                 )
                 return
             except GeminiError as exc:
-                await message.reply(f"I couldn't reach Gemini: {exc}")
+                await message.reply(f"I couldn't get an answer: {exc}")
                 return
             except Exception as exc:  # pragma: no cover - unexpected
                 traceback.print_exc()
@@ -1547,7 +1859,15 @@ class GeminiDiscordBot(discord.Client):
                 await vc.disconnect(force=True)
             except Exception:
                 pass
-        await self.gemini.close()
+        seen: set[int] = set()
+        for client in list(self.providers.values()) + [self.gemini]:
+            if id(client) in seen:
+                continue
+            seen.add(id(client))
+            try:
+                await client.close()
+            except Exception:
+                pass
         await super().close()
 
 
@@ -1601,8 +1921,11 @@ def print_credential_help(missing: list[str]) -> None:
         print("  DISCORD_TOKEN    https://discord.com/developers/applications")
         print("                   Your app -> Bot -> Reset Token.")
         print("                   Also enable the Message Content Intent.\n")
-    if "GEMINI_API_KEY" in missing:
-        print("  GEMINI_API_KEY   https://aistudio.google.com/apikey\n")
+    if any(name != "DISCORD_TOKEN" for name in missing):
+        print("  AI provider - add at least one, all have a free tier:")
+        print("    GEMINI_API_KEY      https://aistudio.google.com/apikey")
+        print("    OPENROUTER_API_KEY  https://openrouter.ai/keys")
+        print("    GROQ_API_KEY        https://console.groq.com/keys\n")
     print("Save the file and run Run.bat again. Nothing is typed into this")
     print("window, so pasting in the editor is all you need to do.\n")
     open_in_editor(ENV_FILE)
@@ -1640,6 +1963,20 @@ def print_voice_status(configured: str) -> None:
         print("[voice] ffmpeg was not found; voice playback needs it (install it or set FFMPEG_PATH).")
 
 
+def print_provider_status(available: list[str], active: str, model: str) -> None:
+    for name, info in PROVIDERS.items():
+        state = "ready" if name in available else f"add {info['key_env']}"
+        mark = "->" if name == active else "  "
+        print(f"[ai] {mark} {name:<10} {state}")
+    print(f"[ai] using {PROVIDERS[active]['label']} with {model}")
+    limits = {
+        "openrouter": "free models: 20 requests/min, 50/day without credit",
+        "groq": "free tier: 30 requests/min, 1000/day per model",
+        "gemini": "free tier limits depend on the model",
+    }
+    print(f"[ai] {limits.get(active, '')}")
+
+
 def build_config(token: str, api_key: str) -> dict[str, Any]:
     return {
         "discord_token": token,
@@ -1654,8 +1991,14 @@ def build_config(token: str, api_key: str) -> dict[str, Any]:
 
 
 def build_defaults() -> dict[str, Any]:
+    configured = env_str("PROVIDER", "auto").lower()
+    if configured in PROVIDER_MODELS:
+        model_default = env_str(f"{configured.upper()}_MODEL", default_model_for(configured))
+    else:
+        model_default = env_str("GEMINI_MODEL", DEFAULT_MODEL)
     return {
-        "model": env_str("GEMINI_MODEL", DEFAULT_MODEL),
+        "provider": configured,
+        "model": model_default,
         "persona": env_str("PERSONA", DEFAULT_PERSONA),
         "temperature": env_float("TEMPERATURE", 0.8),
         "max_tokens": env_int("MAX_TOKENS", 512),
@@ -1677,33 +2020,47 @@ def main() -> None:
     # .env may set FFMPEG_PATH, so resolve it again now that the file is loaded.
     global FFMPEG_PATH
     FFMPEG_PATH = resolve_ffmpeg()
-    config = build_config(
-        env_str("DISCORD_TOKEN"),
-        env_str("GEMINI_API_KEY") or env_str("GOOGLE_API_KEY"),
-    )
-    missing = [
-        name
-        for name, value in (
-            ("DISCORD_TOKEN", config["discord_token"]),
-            ("GEMINI_API_KEY", config["gemini_api_key"]),
-        )
-        if not value
-    ]
+    gemini_key = env_str("GEMINI_API_KEY") or env_str("GOOGLE_API_KEY")
+    config = build_config(env_str("DISCORD_TOKEN"), gemini_key)
+
+    available = configured_providers()
+    missing: list[str] = []
+    if not config["discord_token"]:
+        missing.append("DISCORD_TOKEN")
+    if not available:
+        missing.append("at least one of GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY")
     if missing:
         print_credential_help(missing)
         sys.exit(1)
 
     defaults = build_defaults()
+    active = resolve_provider(defaults["provider"], available)
+    if not model_looks_like(defaults["model"], active):
+        defaults["model"] = default_model_for(active)
+
     if defaults["tts_engine"] not in TTS_ENGINES:
         print(f"[config] unknown TTS_ENGINE '{defaults['tts_engine']}', using auto")
         defaults["tts_engine"] = "auto"
 
+    print_provider_status(available, active, defaults["model"])
     print_voice_status(defaults["tts_engine"])
 
-    store = SettingsStore(SETTINGS_FILE, defaults)
-    bot = GeminiDiscordBot(config, store, GeminiClient(config["gemini_api_key"]))
+    gemini = GeminiClient(gemini_key)
+    clients: dict[str, Any] = {}
+    if gemini_key:
+        clients["gemini"] = gemini
+    for name in ("openrouter", "groq"):
+        key = env_str(PROVIDERS[name]["key_env"])
+        if key:
+            clients[name] = OpenAICompatClient(name, key)
 
-    print(f"\nStarting with model {defaults['model']} and TTS engine {resolve_engine(defaults['tts_engine'])}...")
+    store = SettingsStore(SETTINGS_FILE, defaults)
+    bot = GeminiDiscordBot(config, store, gemini, clients)
+
+    print(
+        f"\nStarting with {PROVIDERS[active]['label']} / {defaults['model']} "
+        f"and TTS engine {resolve_engine(defaults['tts_engine'])}..."
+    )
     try:
         bot.run(config["discord_token"])
     except discord.LoginFailure:
