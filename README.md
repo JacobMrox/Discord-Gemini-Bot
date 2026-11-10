@@ -125,6 +125,9 @@ Per-server changes live in `settings.json` (git-ignored). Delete it or run
   still work without it, voice does not.
 * **"Voice output failed"** – usually a stale voice name or throttling. Try
   `!tts gtts` to confirm playback works, then `!tts edge` again.
+* **Robotic voice, or `!tts` says `gtts`** – edge-tts is not installed. Run `Run.bat`
+  again so it installs the full dependency list; the startup lines report exactly
+  which TTS libraries loaded.
 * **404 on a model** – model IDs change. Run `!models` and pick a current one.
 * **No reply at all** – the bot needs the *Message Content Intent* enabled in the
   developer portal, otherwise it never sees your messages.

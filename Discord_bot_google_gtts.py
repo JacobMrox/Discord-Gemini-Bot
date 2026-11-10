@@ -40,15 +40,20 @@ import aiohttp
 import discord
 from bs4 import BeautifulSoup
 
+EDGE_IMPORT_ERROR = ""
+GTT_IMPORT_ERROR = ""
+
 try:  # optional: the best free voices
     import edge_tts
-except ImportError:  # pragma: no cover - depends on the install
+except Exception as exc:  # a half-broken install should not stop the bot
     edge_tts = None
+    EDGE_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 try:  # optional: robot voice of last resort
     from gtts import gTTS
-except ImportError:  # pragma: no cover - depends on the install
+except Exception as exc:
     gTTS = None
+    GTT_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 # --------------------------------------------------------------------------- #
@@ -63,6 +68,8 @@ TMP_DIR = BASE_DIR / ".tts_cache"
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TTS_MODEL = "gemini-3.8-flash-tts"
 DEFAULT_MODEL = "gemini-3.8-flash"
+#: Seconds to wait for an answer before releasing the typing indicator.
+GENERATE_TIMEOUT = 45
 
 DEFAULT_PERSONA = (
     "You are {name}, a warm, witty Discord chat companion. "
@@ -351,7 +358,7 @@ class GeminiClient:
                     "x-goog-api-key": self.api_key,
                     "Content-Type": "application/json",
                 },
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(total=60, connect=15, sock_read=45),
             )
         return self._session
 
@@ -1080,12 +1087,15 @@ async def cmd_models(bot: "GeminiDiscordBot", message: discord.Message, args: st
 async def cmd_tts(bot: "GeminiDiscordBot", message: discord.Message, args: str, settings: dict) -> None:
     if not args:
         engine = resolve_engine(settings["tts_engine"])
+        note = ""
+        if edge_tts is None:
+            note = "\n\nedge-tts is not installed, so `auto` falls back to gTTS. Run `Run.bat` again to install it."
         await message.reply(
             f"TTS engine: `{settings['tts_engine']}` (resolves to `{engine}`)\n"
             "`edge` - free neural voices, sounds human\n"
             "`gemini` - Gemini 3.8 TTS, most expressive (uses API credits)\n"
             "`gtts` - the classic robot voice\n"
-            "`off` - text only"
+            "`off` - text only" + note
         )
         return
     choice = args.strip().lower()
@@ -1481,13 +1491,21 @@ class GeminiDiscordBot(discord.Client):
 
         async with message.channel.typing():
             try:
-                reply = await self.gemini.generate(
-                    settings["model"],
-                    contents,
-                    self.persona_for(settings),
-                    float(settings["temperature"]),
-                    int(settings["max_tokens"]),
+                reply = await asyncio.wait_for(
+                    self.gemini.generate(
+                        settings["model"],
+                        contents,
+                        self.persona_for(settings),
+                        float(settings["temperature"]),
+                        int(settings["max_tokens"]),
+                    ),
+                    timeout=GENERATE_TIMEOUT,
                 )
+            except asyncio.TimeoutError:
+                await message.reply(
+                    "Gemini took too long to answer, so I stopped waiting. Try again?"
+                )
+                return
             except GeminiError as exc:
                 await message.reply(f"I couldn't reach Gemini: {exc}")
                 return
@@ -1590,6 +1608,38 @@ def print_credential_help(missing: list[str]) -> None:
     open_in_editor(ENV_FILE)
 
 
+def _package_version(name: str) -> str:
+    try:
+        from importlib.metadata import version
+
+        return version(name)
+    except Exception:
+        return "unknown"
+
+
+def print_voice_status(configured: str) -> None:
+    """Report the loaded TTS libraries and the engine they add up to."""
+    if edge_tts is not None:
+        edge_state = f"edge-tts {_package_version('edge-tts')}"
+    else:
+        edge_state = "edge-tts MISSING" + (f" ({EDGE_IMPORT_ERROR})" if EDGE_IMPORT_ERROR else "")
+    if gTTS is not None:
+        gtts_state = f"gTTS {_package_version('gTTS')}"
+    else:
+        gtts_state = "gTTS MISSING" + (f" ({GTT_IMPORT_ERROR})" if GTT_IMPORT_ERROR else "")
+
+    engine = resolve_engine(configured)
+    print(f"[voice] {edge_state} | {gtts_state}")
+    print(f"[voice] TTS_ENGINE={configured} resolves to '{engine}'")
+    if engine == "gtts" and edge_tts is None:
+        print("[voice] edge-tts is not installed, so the robotic voice is being used.")
+        print("[voice] Fix: python -m pip install -r requirements.txt, then restart.")
+    if engine == "none":
+        print("[voice] no TTS library is installed - replies will be text only.")
+    if not FFMPEG_PATH:
+        print("[voice] ffmpeg was not found; voice playback needs it (install it or set FFMPEG_PATH).")
+
+
 def build_config(token: str, api_key: str) -> dict[str, Any]:
     return {
         "discord_token": token,
@@ -1648,10 +1698,7 @@ def main() -> None:
         print(f"[config] unknown TTS_ENGINE '{defaults['tts_engine']}', using auto")
         defaults["tts_engine"] = "auto"
 
-    if not FFMPEG_PATH:
-        print("[warn] ffmpeg was not found. Voice playback needs it: install ffmpeg or drop ffmpeg.exe next to this script.")
-    if edge_tts is None and gTTS is None:
-        print("[warn] neither edge-tts nor gTTS is installed, so the bot can only reply with text.")
+    print_voice_status(defaults["tts_engine"])
 
     store = SettingsStore(SETTINGS_FILE, defaults)
     bot = GeminiDiscordBot(config, store, GeminiClient(config["gemini_api_key"]))
@@ -1663,9 +1710,6 @@ def main() -> None:
         sys.exit("Discord rejected the token. Check DISCORD_TOKEN.")
     except KeyboardInterrupt:
         print("\nStopping.")
-    finally:
-        if os.name == "nt" and sys.stdin.isatty():
-            input("Press Enter to exit...")
 
 
 if __name__ == "__main__":

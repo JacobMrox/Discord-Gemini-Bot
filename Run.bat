@@ -9,15 +9,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -c "import discord, aiohttp" >nul 2>nul
+rem Check every module the bot imports. A machine that already had discord.py used
+rem to pass a narrower check, skip the install and silently lose edge-tts.
+python -c "import discord, aiohttp, edge_tts, gtts, bs4" >nul 2>nul
 if errorlevel 1 (
     echo Installing dependencies from requirements.txt...
-    python -m pip install --upgrade pip
-    python -m pip install -r requirements.txt
+    python -m pip install --disable-pip-version-check -r requirements.txt
+    python -c "import discord, aiohttp, edge_tts, gtts, bs4" >nul 2>nul
     if errorlevel 1 (
-        echo Dependency install failed. Fix the error above and run this file again.
-        pause
-        exit /b 1
+        echo.
+        echo Some dependencies are still missing. Run: python -m pip install -r requirements.txt
+        echo The bot will still start, but the natural voice may be unavailable.
+        echo.
     )
 )
 
